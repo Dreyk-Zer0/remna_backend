@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  GHCR_IMAGE: ghcr.io/Dreyk-Zer0/remna_backend
+  GHCR_IMAGE: ghcr.io/dreyk-zer0/remna_backend
   IMAGE_TAG: dev
 
 jobs:
