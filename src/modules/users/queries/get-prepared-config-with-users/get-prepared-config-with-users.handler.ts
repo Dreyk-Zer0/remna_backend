@@ -3,6 +3,7 @@ import { IQueryHandler, QueryBus, QueryHandler } from '@nestjs/cqrs';
 
 import { HashedSet } from '@remnawave/hashed-set';
 
+import { applyClientInjects } from '@common/helpers/xray-config/client-injects.util';
 import { XRayConfig } from '@common/helpers/xray-config/xray-config.validator';
 import { fail, ok, TResult } from '@common/types';
 import { ERRORS } from '@libs/contracts/constants';
@@ -69,6 +70,8 @@ export class GetPreparedConfigWithUsersHandler implements IQueryHandler<
             for await (const userBatch of usersStream) {
                 config.includeUserBatch(userBatch, inboundsUserSets);
             }
+
+            applyClientInjects(config.getConfig() as unknown as Record<string, unknown>);
 
             for (const [tag, set] of inboundsUserSets) {
                 this.logger.debug(`Inbound ${tag}: hash ${set.hash64String} and ${set.size} users`);
