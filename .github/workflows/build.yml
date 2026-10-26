@@ -1,0 +1,118 @@
+name: Rebuild branch image
+
+# Catches HUMAN pushes to patched branches (GITHUB_TOKEN pushes never fire
+# push events, so automation from sync.yml does not loop here) and manual
+# workflow_dispatch for rebuilds of frozen lines. Image tags follow the same
+# rules as sync.yml:
+#   reverse-fix    -> :dev
+#   stable/x.y.z   -> :x.y.z :<major> :latest (latest moves only via a green
+#                     patched stable build — that is the point of this file)
+
+on:
+  push:
+    branches:
+      - reverse-fix
+      - 'stable/**'
+
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to rebuild (reverse-fix or stable/<tag>)
+        required: true
+        default: reverse-fix
+
+# NOTE: GITHUB_TOKEN cannot be granted a "releases" permission (not a valid
+# key); releases API calls are authorized by contents: write.
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/dreyk-zer0/remna_backend
+  FRONTEND_REPO: Dreyk-Zer0/remna_frontend
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  rebuild:
+    name: Build ${{ inputs.branch || github.ref_name }}
+    runs-on: ubuntu-24.04
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.ref_name }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r .version package.json)
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          if [ "$TARGET_BRANCH" = "reverse-fix" ]; then
+            TAGS=(-t "$IMAGE:dev")
+            FRONTEND_REF="reverse-fix"
+            FRONTEND_ASSET="https://github.com/$FRONTEND_REPO/releases/download/dev-build/remnawave-frontend.zip"
+            BRANCH_ARG="dev"
+            SCOPE="dev"
+          elif [[ "$TARGET_BRANCH" == stable/* ]]; then
+            TAG="${TARGET_BRANCH#stable/}"
+            TAGS=(-t "$IMAGE:$TAG" -t "$IMAGE:${TAG%%.*}" -t "$IMAGE:latest")
+            FRONTEND_REF="$TARGET_BRANCH"
+            FRONTEND_ASSET="https://github.com/$FRONTEND_REPO/releases/download/$TAG/remnawave-frontend.zip"
+            # BRANCH bakes into ENV REMNAWAVE_BRANCH, whose zod schema ONLY
+            # accepts "dev"|"main" (upstream passes main for tag builds).
+            # Line identity lives in __RW_METADATA_GIT_BRANCH below, not here.
+            BRANCH_ARG="main"
+            SCOPE="stable"
+          else
+            echo "Unsupported branch: $TARGET_BRANCH" >&2
+            exit 1
+          fi
+          FRONTEND_COMMIT=$(curl -s "https://api.github.com/repos/$FRONTEND_REPO/commits/$FRONTEND_REF" | jq -r '.sha // "unknown"')
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-from "type=gha,scope=$SCOPE" \
+            "${TAGS[@]}" \
+            --build-arg "FRONTEND_URL=$FRONTEND_ASSET" \
+            --build-arg "BRANCH=$BRANCH_ARG" \
+            --build-arg "__RW_METADATA_VERSION=$VERSION" \
+            --build-arg "__RW_METADATA_GIT_BRANCH=$TARGET_BRANCH" \
+            --build-arg "__RW_METADATA_BUILD_TIME=$BUILD_TIME" \
+            --build-arg "__RW_METADATA_BUILD_NUMBER=${{ github.run_number }}" \
+            --build-arg "__RW_METADATA_GIT_BACKEND_COMMIT=$(git rev-parse HEAD)" \
+            --build-arg "__RW_METADATA_GIT_FRONTEND_COMMIT=$FRONTEND_COMMIT" \
+            --push .
+
+      - name: Publish dev-build marker (dev line only)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ "$TARGET_BRANCH" = "reverse-fix" ] || exit 0
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:dev" --format '{{json .Manifest}}' | jq -r '.digest')
+          [ "$DIGEST" != null ] || { echo "no digest for $IMAGE:dev" >&2; exit 1; }
+          NOTES=$(printf 'Rolling patched dev image (reverse-fix line). NOT a release artifact.\n- image: %s:dev\n- digest: %s\n- backend commit: %s\n- run: %s/%s/actions/runs/%s' "$IMAGE" "$DIGEST" "$(git rev-parse HEAD)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh release view dev-build >/dev/null 2>&1 || \
+            gh release create dev-build --prerelease --title "dev-build (fork rolling)" --notes "$NOTES"
+          gh release edit dev-build --prerelease --title "dev-build (fork rolling)" --notes "$NOTES"
+          gh release view dev-build >/dev/null
+
+      - name: Ensure release marker (stable lines only)
+        if: startsWith(env.TARGET_BRANCH, 'stable/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${TARGET_BRANCH#stable/}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG (patched fork)" \
+              --notes "Backend $TAG fork line. Images: $IMAGE:$TAG. Marker created by build.yml."
